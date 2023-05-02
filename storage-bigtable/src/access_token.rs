@@ -17,6 +17,7 @@ use {
         time::Instant,
     },
     tokio::time,
+    std::sync::Mutex,
 };
 
 fn load_credentials(filepath: Option<String>) -> Result<Credentials, String> {
@@ -93,39 +94,42 @@ impl AccessToken {
     /// Call this function regularly to ensure the access token does not expire
     pub async fn refresh(&self) {
         // Check if it's time to try a token refresh
-        {
-            let token_r = self.token.read().unwrap();
-            if token_r.1.elapsed().as_secs() < token_r.0.expires_in() as u64 / 2 {
-                return;
-            }
-
-            #[allow(deprecated)]
-            if self
-                .refresh_active
-                .compare_and_swap(false, true, Ordering::Relaxed)
-            {
-                // Refresh already pending
-                return;
-            }
+        let token_r = self.token.read().unwrap();
+        if token_r.1.elapsed().as_secs() < token_r.0.expires_in() as u64 / 2 {
+            return;
         }
-
+    
+        // Check if a refresh is already pending
+        if self.refresh_active.load(Ordering::SeqCst) {
+            return;
+        }
+    
+        // Acquire the refresh lock
+        let mut refresh_lock = self.refresh_active.lock().unwrap();
+        if *refresh_lock {
+            // Refresh already pending
+            let token_refresh_time = self.token_refresh_start_time.load(Ordering::SeqCst);
+            if token_refresh_time != 0 && token_refresh_time + (self.get_token_timeout_seconds * 2) < token_r.1.elapsed().as_secs() {
+                warn!("Token refresh timeout failed to timeout!");
+                *refresh_lock = false;
+            }
+            return;
+        }
+    
         info!("Refreshing token");
-        match time::timeout(
-            time::Duration::from_secs(5),
-            Self::get_token(&self.credentials, &self.scope),
-        )
-        .await
-        {
-            Ok(new_token) => match (new_token, self.token.write()) {
-                (Ok(new_token), Ok(mut token_w)) => *token_w = new_token,
-                (Ok(_new_token), Err(err)) => warn!("{}", err),
-                (Err(err), _) => warn!("{}", err),
+        self.token_refresh_start_time.store(token_r.1.elapsed().as_secs(), Ordering::Relaxed);
+    
+        match Self::get_token(&self.credentials, &self.scope).await {
+            Ok(new_token) => match self.token.write() {
+                Ok(mut token_w) => *token_w = new_token,
+                Err(err) => warn!("{}", err),
             },
-            Err(_) => {
-                warn!("Token refresh timeout")
-            }
+            Err(err) => warn!("{}", err),
         }
-        self.refresh_active.store(false, Ordering::Relaxed);
+    
+        info!("Token refresh Complete!");
+        self.token_refresh_start_time.store(0, Ordering::Relaxed);
+        *refresh_lock = false;
     }
 
     /// Return an access token suitable for use in an HTTP authorization header
