@@ -98,27 +98,27 @@ impl AccessToken {
         if token_r.1.elapsed().as_secs() < token_r.0.expires_in() as u64 / 2 {
             return;
         }
-    
+
         // Check if a refresh is already pending
         if self.refresh_active.load(Ordering::SeqCst) {
             return;
         }
-    
+
         // Acquire the refresh lock
         let mut refresh_lock = self.refresh_active.lock().unwrap();
         if *refresh_lock {
             // Refresh already pending
-            let token_refresh_time = self.token_refresh_start_time.load(Ordering::SeqCst);
-            if token_refresh_time != 0 && token_refresh_time + (self.get_token_timeout_seconds * 2) < token_r.1.elapsed().as_secs() {
+            let token_refresh_time = self.token_refresh_start_time().load(Ordering::SeqCst);
+            if token_refresh_time != 0 && token_refresh_time + (self.get_token_timeout_seconds() * 2) < token_r.1.elapsed().as_secs() {
                 warn!("Token refresh timeout failed to timeout!");
                 *refresh_lock = false;
             }
             return;
         }
-    
+
         info!("Refreshing token");
-        self.token_refresh_start_time.store(token_r.1.elapsed().as_secs(), Ordering::Relaxed);
-    
+        self.token_refresh_start_time().store(token_r.1.elapsed().as_secs(), Ordering::Relaxed);
+
         match Self::get_token(&self.credentials, &self.scope).await {
             Ok(new_token) => match self.token.write() {
                 Ok(mut token_w) => *token_w = new_token,
@@ -126,12 +126,19 @@ impl AccessToken {
             },
             Err(err) => warn!("{}", err),
         }
-    
+
         info!("Token refresh Complete!");
-        self.token_refresh_start_time.store(0, Ordering::Relaxed);
+        self.token_refresh_start_time().store(0, Ordering::Relaxed);
         *refresh_lock = false;
     }
 
+    fn token_refresh_start_time(&self) -> &Arc<AtomicU64> {
+        &self.token_refresh_start_time
+    }
+
+    fn get_token_timeout_seconds(&self) -> u64 {
+        self.get_token_timeout_seconds
+    }
     /// Return an access token suitable for use in an HTTP authorization header
     pub fn get(&self) -> String {
         let token_r = self.token.read().unwrap();
